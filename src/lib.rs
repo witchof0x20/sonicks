@@ -16,7 +16,12 @@
     You should have received a copy of the GNU General Public License
     along with sonicks.  If not, see <https://www.gnu.org/licenses/>.
 */
+#![feature(int_to_from_bytes, try_from)]
+
 extern crate hyper;
 extern crate tokio;
 
+mod error;
+mod method;
+mod reply;
 pub mod socks;

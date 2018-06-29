@@ -16,15 +16,19 @@
     You should have received a copy of the GNU General Public License
     along with sonicks.  If not, see <https://www.gnu.org/licenses/>.
 */
-use std::convert::TryInto;
+use std::convert::{Into, TryInto};
 use std::io;
-use std::net::{SocketAddr, IpAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use hyper::client::connect::{Connect, Connected, Destination};
 use tokio::io::{read_exact, write_all};
 use tokio::net::TcpStream;
 use tokio::prelude::*;
+
+use error;
+use method::Socks5Method;
+use reply::Socks5Reply;
 
 /// A SOCKS5 proxy
 ///
@@ -45,6 +49,17 @@ impl Socks5hProxy {
     pub fn new(addr: SocketAddr) -> Self {
         Socks5hProxy { addr }
     }
+    /// Sends the initial method negotiation handshake
+    /// # Parameters
+    /// * `socket` - the socket to send and receive the handshake over
+    fn method_handshake(socket: TcpStream) -> impl Future<Item=(TcpStream, u8, Socks5Method), Error=io::Error> {
+        // Send the supported methods
+        write_all(socket, [Self::VER, 1, Socks5Method::NoAuthRequired.into()])
+            // Remove the extra field
+            .and_then(|(socket, _)| read_exact(socket, [0x00; 2]))
+            .and_then(|(socket, method_resp)| future::ok((socket, method_resp[0], method_resp[1].into())))
+    }
+
 }
 
 impl Connect for Socks5hProxy {
@@ -53,38 +68,34 @@ impl Connect for Socks5hProxy {
     /// Uses `std::io::Error`
     type Error = io::Error;
     /// Boxes make things simpler
-    type Future = Box<Future<Item=(TcpStream, Connected), Error=io::Error> + Send>;
+    type Future = Box<Future<Item = (TcpStream, Connected), Error = io::Error> + Send>;
     /// Connects to the destination through the proxy
     /// # Parameters
     /// * `dst` - the destination to connect to
     fn connect(&self, dst: Destination) -> Self::Future {
         // Connect to the proxy
         let handshake = TcpStream::connect(&self.addr)
-            // Send supported methods
-            .and_then(|socket| write_all(socket, [Self::VER, 1, 0x00]))
-            // Get a supported method back from the server
-            .and_then(|(socket, _)| read_exact(socket, [0x00; 2]))
-            // Determine if the supported method is valid
-            // Check SOCKS version
-            .and_then(|(socket, method)| if method[0] == Self::VER {
-                // Check method
-                if method[1] == 0 {
-                    // Return the socket by itself
-                    Ok(socket)
-                }             
-                else {
-                    Err(io::Error::new(io::ErrorKind::Other, "server returned unsupported method"))
-                }
-            }
-            else {
-                Err(io::Error::new(io::ErrorKind::Other, "server returned unsupported SOCKS version"))
+            // Send supported methods and receive a method/version back
+            .and_then(|socket| Self::method_handshake(socket))
+            // Check the method and version
+            .and_then(|(socket, version, method)| match (version, method) {
+                // No authentication 
+                (Self::VER, Socks5Method::NoAuthRequired) => Ok(socket),
+                // TODO: user/pass auth and GSSAPI
+                // Specific error for when no acceptable methods are returned
+                (Self::VER, Socks5Method::NoAcceptable) => Err(error::no_acceptable_methods()),
+                // Unsupported method
+                (Self::VER, method) => Err(error::unsupported_method(method)),
+                // Unsupported SOCKS version
+                (version, _) => Err(error::unsupported_version(version))
             })
             // Send the connection request
             .and_then(move |socket| {
                 // Initialize the request with known values
                 let mut request: Vec<u8> = vec![Self::VER, 0x01, Self::RSV];
-                // Add the IP
+                // Try to parse the destination as an IP address
                 match IpAddr::from_str(dst.host()) {
+                    // If the parsing works
                     Ok(ip) => match ip  {
                         IpAddr::V4(ip) => {
                             request.push(0x01);
@@ -95,86 +106,116 @@ impl Connect for Socks5hProxy {
                             request.extend_from_slice(&ip.octets());
                         }
                     },
+                    // If the parsing fails, treat the
+                    // destination as a hostname
                     Err(_) => {
                         request.push(0x03);
+                        // Extract the hostname from the destination
                         let host = dst.host();
+                        // Ensure the host's length is compliant
                         let length: u8 = match host.len().try_into() {
+                            // Zero-length or too long
+                            Ok(0) | Err(_) => 
+                                return Err(error::invalid_host_length(host.len())),
+                            // Normal case
                             Ok(length) => length,
-                            Err(err) => return Box::<Future<Item = TcpStream, Error=io::Error> + Send>::new(future::result(
-                                Err(io::Error::new(io::ErrorKind::Other, format!("invalid length for hostname: {}", err)))
-                            ))
                         };
+                        // Add the length byte to the request
                         request.push(length);
+                        // Add the hostname as bytes to the request
                         request.extend(host.bytes());
                     }
                 };
+                // Get the port
+                let port = match dst.port() {
+                    Some(port) => port,
+                    // If the port is not specified, use
+                    // the scheme to determine it
+                    None => match dst.scheme() {
+                        "http" => 80,
+                        "https" => 443,
+                        scheme => return Err(error::unsupported_scheme(scheme))
+                    }
+                };
                 // Add the port
-                request.extend_from_slice(&dst.port().unwrap_or_else(|| 80).to_be().to_bytes());
+                request.extend_from_slice(
+                    &port
+                        .to_be()
+                        .to_bytes()
+                );
                 // Write the request over the socket 
-                Box::<Future<Item = TcpStream, Error=io::Error> + Send>::new(write_all(socket, request).map(|(socket, _)| socket))
+                Ok(write_all(socket, request).map(|(socket, _)| socket))
             })
+            // Result here is a future of a future, so we need to flatten it
+            .flatten()
             // Read in the first part of the response
             // VER, REP, RSV, ATYP are the same size in all responses
             .and_then(|socket| {
                 read_exact(socket, [0x00; 4])
             })
             // Verify the version, reply, and reserved byte
-            .and_then(|(socket, reply)| {
+            .and_then(|(socket, response)| {
                 // Check version
-                if reply[0] != Self::VER {
-                    return Err(io::Error::new(io::ErrorKind::Other, "server returned unsupported SOCKS version"))
+                if response[0] != Self::VER {
+                    return Err(error::unsupported_version(response[0]))
                 }
-                // Check reply code
-                if reply[1] != 0x00 {
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("server replied with failure code {}", reply[1])))
+                // Check the reply code
+                let reply = response[1].into();
+                if reply != Socks5Reply::Succeeded {
+                    return Err(error::reply_error(reply))
                 }
                 // Check reserved byte
-                if reply[2] != 0x00 {
-                    return Err(io::Error::new(io::ErrorKind::Other, "server replied with invalid reserved byte"))
+                if response[2] != Self::RSV { 
+                    return Err(error::invalid_reserved(response[2]))
                 }
                 // TODO: Check address type is known
                 // Return the socket and address type
-                Ok((socket, reply[3]))
+                Ok((socket, response[3]))
             })
             // Read in the address
             .and_then(|(socket, atyp)| {
                 let address_future: Box<Future<Item=TcpStream, Error=io::Error> + Send> = match atyp {
                     // IPv4
                     0x01 => {
-                        Box::new(
-                            read_exact(socket, [0x00; 4])
-                                .map(|(socket, _)| socket)
-                        )
+                        // Create the future to read an IPV4 address
+                        let fut = read_exact(socket, [0x00; 4])
+                            .map(|(socket, _)| socket);
+                        // Box it
+                        Box::new(fut)
                     },
                     // Hostname
                     0x03 => {
-                        Box::new(
-                            read_exact(socket, [0x00; 1])
-                                .and_then(|(socket, len)| read_exact(socket, vec![0x00; len[0] as usize]))
-                                .map(|(socket, _)| socket)
-                        )
+                        // Create the future to read the hostname
+                        let fut = read_exact(socket, [0x00; 1])
+                            .and_then(|(socket, len)|
+                                read_exact(socket, vec![0x00; len[0] as usize])
+                            )
+                            .map(|(socket, _)| socket);
+                        // Box it
+                        Box::new(fut)
                     },
                     // Ipv6
                     0x04 => {
-                        Box::new(
-                            read_exact(socket, [0x00; 16])
-                                .map(|(socket, _)| socket)
-                        )
+                        // Create the future to read an IPV6 address
+                        let fut = read_exact(socket, [0x00; 16])
+                            .map(|(socket, _)| socket);
+                        // Box it
+                        Box::new(fut)
                     }
                     // Invalid values
-                    _ => {
-                        Box::new(
-                            future::result(
-                                Err(io::Error::new(io::ErrorKind::Other, "server replied with invalid address type"))
-                            )
-                        )
+                    atyp => {
+                        // Create an error
+                        let err = error::invalid_address_type(atyp);
+                        // Box it
+                        Box::new(future::err(err))
                     }
                 };
                 address_future
             })
             // Read the port
-            .and_then(|socket| {println!("reading port"); read_exact(socket, [0x00; 2])})
-            // Strip down to only the socket and something indicating the connection was successful
+            .and_then(|socket| read_exact(socket, [0x00; 2]))
+            // Strip down to only the socket and something
+            // indicating the connection was successful
             .map(|(socket, _)| (socket, Connected::new()));
         // Box up the handshake
         Box::new(handshake)
@@ -188,17 +229,17 @@ mod test {
     use std::io::{self, Write};
 
     use hyper;
-    use hyper::Client;
     use hyper::rt::{self, Future, Stream};
+    use hyper::Client;
     /// Tests the client using an existing local proxy on port 8080
     #[test]
     fn test_proxy() {
-        let dst_addr = "http://47.52.240.125/ip".parse().unwrap();
+        let dst_addr = "http://httpbin.net/ip".parse().unwrap();
         rt::run(fetch_url(dst_addr));
     }
 
-    fn fetch_url(url: hyper::Uri) -> impl Future<Item=(), Error=()> {
-        let proxy_addr = "127.0.0.1:9050".parse().unwrap();
+    fn fetch_url(url: hyper::Uri) -> impl Future<Item = (), Error = ()> {
+        let proxy_addr = "192.168.0.9:8080".parse().unwrap();
         let proxy = Socks5hProxy::new(proxy_addr);
         let client: Client<Socks5hProxy, hyper::Body> = Client::builder().build(proxy);
 
@@ -226,6 +267,5 @@ mod test {
             .map_err(|err| {
                 eprintln!("Error {}", err);
             })
-
     }
 }
